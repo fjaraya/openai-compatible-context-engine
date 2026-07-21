@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openai-compatible-context-engine"
+version = "0.1.0"
+description = "Domain-agnostic context budgeting, ranking, reduction, and OpenAI-compatible message assembly for Python."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Sentinelle Labs"}]
+dependencies = []
+
+[project.optional-dependencies]
+tiktoken = ["tiktoken>=0.7"]
+transformers = ["transformers>=4.40"]
+openai = ["openai>=1.30"]
+dev = ["pytest>=8", "build>=1.2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
