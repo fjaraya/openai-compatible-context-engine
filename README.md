@@ -43,7 +43,7 @@ is sent to an OpenAI-compatible endpoint.
 - Weighted ranking by priority, relevance, and recency
 - Optional custom scoring callbacks
 - Score-per-token selection
-- Exact-content deduplication
+- Configurable deduplication: none, exact, normalized, or near-duplicate similarity
 - Per-category token limits
 - Query-aware extractive reduction
 - Head-and-tail truncation fallback
@@ -106,6 +106,7 @@ Run the comparison example:
 
 ```bash
 uv run python examples/compare_with_without_engine.py
+uv run python examples/compare_deduplication_modes.py
 ```
 
 ### Enable optional integrations
@@ -144,15 +145,15 @@ The generated files are placed in `dist/`:
 
 ```text
 dist/
-├── openai_compatible_context_engine-0.1.0-py3-none-any.whl
-└── openai_compatible_context_engine-0.1.0.tar.gz
+├── openai_compatible_context_engine-0.2.0-py3-none-any.whl
+└── openai_compatible_context_engine-0.2.0.tar.gz
 ```
 
 Test the wheel in an isolated environment:
 
 ```bash
 uv run \
-  --with ./dist/openai_compatible_context_engine-0.1.0-py3-none-any.whl \
+  --with ./dist/openai_compatible_context_engine-0.2.0-py3-none-any.whl \
   --no-project \
   python -c "from openai_context_engine import ContextBuilder; print('Import successful')"
 ```
@@ -480,7 +481,7 @@ response = client.chat.completions.create(
 |---|---|
 | Concatenates all available data | Selects context within a defined budget |
 | May consume output capacity | Reserves output tokens explicitly |
-| Duplicate content is sent repeatedly | Exact duplicates are removed |
+| Duplicate content is sent repeatedly | Configurable exact, normalized, or near-duplicate deduplication |
 | Large items dominate the prompt | Large items may be reduced |
 | Context order is usually accidental | Context is ranked by policy |
 | One source can consume the whole prompt | Categories can have token limits |
@@ -684,6 +685,150 @@ context window
 - fixed overhead
 ```
 
+### Deduplication modes
+
+Deduplication runs after minimum-score filtering and before token-budget
+selection. It prevents redundant context items from consuming model input.
+Configure it through `ContextPolicy.deduplication_mode`:
+
+```python
+policy = ContextPolicy(
+    deduplication_mode="normalized",
+)
+```
+
+Supported modes:
+
+| Mode | Behavior | Typical use |
+|---|---|---|
+| `none` | Keeps every eligible item | Diagnostics or cases where repetition is intentional |
+| `exact` | Removes byte-for-byte identical rendered content | Safe default for general applications |
+| `normalized` | Normalizes Unicode, letter case, and whitespace before exact matching | Repeated data with formatting differences |
+| `similarity` | Applies normalized matching, then character-level near-duplicate comparison | Highly repetitive text with small wording changes |
+
+The default is:
+
+```python
+ContextPolicy(deduplication_mode="exact")
+```
+
+#### Exact mode
+
+```python
+items = [
+    ContextItem(id="a", content="Service availability is 99.95%."),
+    ContextItem(id="b", content="Service availability is 99.95%."),
+]
+```
+
+Item `b` is audited as `deduplicated` because its rendered content is exactly
+identical to item `a`.
+
+#### Normalized mode
+
+```python
+policy = ContextPolicy(
+    deduplication_mode="normalized",
+)
+```
+
+The default normalizer applies:
+
+- Unicode NFKC normalization
+- Unicode-aware case folding
+- Leading and trailing whitespace removal
+- Repeated-whitespace collapse
+
+Therefore, these values match:
+
+```text
+Service availability is 99.95%.
+  service   availability is 99.95%.  
+```
+
+The default normalizer deliberately preserves punctuation, timestamps,
+identifiers, and numbers because those values may be operationally important.
+
+#### Similarity mode
+
+```python
+policy = ContextPolicy(
+    deduplication_mode="similarity",
+    deduplication_similarity_threshold=0.90,
+)
+```
+
+Similarity mode first performs normalized matching and then compares remaining
+items with Python's deterministic `difflib.SequenceMatcher`. The threshold must
+be between `0.0` and `1.0`; higher values are more conservative.
+
+This mode detects near duplicates, not semantic equivalence. It can recognize
+small edits such as pluralization or minor wording changes, but it does not use
+embeddings and does not understand meaning. It also compares retained
+candidates pairwise, so it can become expensive for very large item sets.
+Apply retrieval or coarse filtering before context construction when processing
+thousands of fragments.
+
+A practical starting range is `0.88` to `0.95`. Lower thresholds remove more
+content but increase the risk of discarding material differences.
+
+#### Custom normalization
+
+Applications can remove volatile values before normalized or similarity
+matching:
+
+```python
+import re
+
+
+def remove_request_values(text: str) -> str:
+    text = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f-]{27,36}\b",
+        "<uuid>",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+        "<timestamp>",
+        text,
+    )
+    return text
+
+
+policy = ContextPolicy(
+    deduplication_mode="normalized",
+    deduplication_normalizer=remove_request_values,
+)
+```
+
+The custom normalizer must return a string. The library applies its standard
+Unicode, case, and whitespace normalization after the callback.
+
+#### Pinned duplicate behavior
+
+Pinned duplicate items are retained by default because `pinned=True` means the
+application considers them mandatory:
+
+```python
+policy = ContextPolicy(
+    deduplication_mode="exact",
+    deduplicate_pinned=False,
+)
+```
+
+To allow duplicate pinned items to be removed:
+
+```python
+policy = ContextPolicy(
+    deduplication_mode="exact",
+    deduplicate_pinned=True,
+)
+```
+
+Every removed item appears in the audit report with the matching item ID,
+deduplication mode, and similarity score when applicable.
+
 ### Pinned items
 
 Pinned items are processed before optional items.
@@ -732,6 +877,78 @@ ContextPolicy(selection_mode="score_per_token")
 
 The second mode is usually more effective when items vary significantly in
 length.
+
+## Compare deduplication modes with an OpenAI-compatible endpoint
+
+The repository includes:
+
+```text
+examples/compare_deduplication_modes.py
+```
+
+It uses the same source items and user question with all four modes:
+
+```text
+none
+exact
+normalized
+similarity
+```
+
+Run the offline comparison first:
+
+```bash
+uv run python examples/compare_deduplication_modes.py
+```
+
+The output shows request size, selected items, deduplicated items, dropped
+items, and the complete audit trail for each mode.
+
+To send one real model request per mode:
+
+```bash
+uv sync --extra openai
+
+export OPENAI_BASE_URL="https://your-endpoint.example.com/v1"
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_MODEL="your-model"
+
+uv run python examples/compare_deduplication_modes.py --call-api
+```
+
+This makes **four endpoint calls** by default and prints all four responses plus
+latency and endpoint-reported token usage. Calls may incur provider cost.
+
+Compare only selected modes:
+
+```bash
+uv run python examples/compare_deduplication_modes.py \\
+  --modes exact normalized similarity \\
+  --call-api
+```
+
+Change the near-duplicate threshold:
+
+```bash
+uv run python examples/compare_deduplication_modes.py \\
+  --similarity-threshold 0.90 \\
+  --call-api
+```
+
+Optionally pass a temperature when the endpoint supports it:
+
+```bash
+uv run python examples/compare_deduplication_modes.py \\
+  --temperature 0 \\
+  --call-api
+```
+
+> **API comparison caveat:** Each mode is evaluated with a separate model call.
+> The responses are not a deterministic controlled experiment. Differences can
+> result from the context, but also from sampling, temperature, backend routing,
+> provider-side model updates, hidden prompts, caching, request order, service
+> load, and timing. Use repeated runs and task-specific quality checks before
+> attributing response differences solely to a deduplication mode.
 
 ## Tokenizers
 
@@ -948,6 +1165,7 @@ Run the examples:
 ```bash
 uv run python examples/openai_compatible.py
 uv run python examples/compare_with_without_engine.py
+uv run python examples/compare_deduplication_modes.py
 ```
 
 Build the package:
@@ -961,7 +1179,7 @@ Verify the generated wheel independently:
 
 ```bash
 uv run \
-  --with ./dist/openai_compatible_context_engine-0.1.0-py3-none-any.whl \
+  --with ./dist/openai_compatible_context_engine-0.2.0-py3-none-any.whl \
   --no-project \
   python -c "import openai_context_engine; print(openai_context_engine.__file__)"
 ```

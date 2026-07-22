@@ -55,6 +55,10 @@ class ContextPolicy:
     selection_mode: str = "score_per_token"
     category_limits: Mapping[str, int | float] = field(default_factory=dict)
     allow_reduce_pinned: bool = True
+    deduplication_mode: str = "exact"
+    deduplication_similarity_threshold: float = 0.92
+    deduplicate_pinned: bool = False
+    deduplication_normalizer: Callable[[str], str] | None = None
     custom_score: Callable[[ContextItem], float] | None = None
 
     @property

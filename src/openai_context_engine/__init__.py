@@ -1,4 +1,10 @@
 from .builder import ContextBuilder
+from .deduplication import (
+    Deduplicator,
+    DuplicateMatch,
+    SUPPORTED_DEDUPLICATION_MODES,
+    default_normalize_text,
+)
 from .exceptions import (
     BudgetConfigurationError,
     ContextEngineError,
@@ -31,13 +37,17 @@ __all__ = [
     "ContextEngineError",
     "ContextItem",
     "ContextPolicy",
+    "Deduplicator",
+    "DuplicateMatch",
     "Decision",
     "HeadTailReducer",
     "PinnedItemOverflowError",
     "QueryAwareSentenceReducer",
     "Reducer",
+    "SUPPORTED_DEDUPLICATION_MODES",
     "SelectedItem",
     "TiktokenTokenizer",
     "Tokenizer",
     "TransformersTokenizer",
+    "default_normalize_text",
 ]

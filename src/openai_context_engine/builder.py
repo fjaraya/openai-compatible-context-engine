@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-import hashlib
 import math
 from typing import Iterable, Sequence
 
+from .deduplication import Deduplicator, SUPPORTED_DEDUPLICATION_MODES
 from .exceptions import BudgetConfigurationError, PinnedItemOverflowError
 from .models import (
     AuditEntry,
@@ -48,6 +48,16 @@ class ContextBuilder:
         if policy.selection_mode not in {"score", "score_per_token"}:
             raise BudgetConfigurationError(
                 "selection_mode must be 'score' or 'score_per_token'"
+            )
+        deduplication_mode = policy.deduplication_mode.lower().strip()
+        if deduplication_mode not in SUPPORTED_DEDUPLICATION_MODES:
+            supported = ", ".join(sorted(SUPPORTED_DEDUPLICATION_MODES))
+            raise BudgetConfigurationError(
+                "deduplication_mode must be one of: " + supported
+            )
+        if not 0.0 <= policy.deduplication_similarity_threshold <= 1.0:
+            raise BudgetConfigurationError(
+                "deduplication_similarity_threshold must be between 0.0 and 1.0"
             )
 
     def _score(self, item: ContextItem, now: datetime) -> float:
@@ -133,7 +143,11 @@ class ContextBuilder:
         item_budget = input_budget - fixed_tokens
         audit: list[AuditEntry] = []
         candidates: list[tuple[ContextItem, str, int, float]] = []
-        seen_hashes: dict[str, str] = {}
+        deduplicator = Deduplicator(
+            mode=self.policy.deduplication_mode,
+            similarity_threshold=self.policy.deduplication_similarity_threshold,
+            custom_normalizer=self.policy.deduplication_normalizer,
+        )
 
         for item in items:
             rendered = item.render()
@@ -141,23 +155,6 @@ class ContextBuilder:
             if token_count is None:
                 token_count = self.tokenizer.count(rendered)
             score = self._score(item, now)
-
-            digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
-            duplicate_of = seen_hashes.get(digest)
-            if duplicate_of is not None and not item.pinned:
-                audit.append(
-                    AuditEntry(
-                        item_id=item.id,
-                        decision=Decision.DEDUPLICATED,
-                        reason=f"identical content already provided by {duplicate_of}",
-                        original_tokens=token_count,
-                        final_tokens=0,
-                        score=score,
-                        category=item.category,
-                    )
-                )
-                continue
-            seen_hashes[digest] = item.id
 
             if score < self.policy.minimum_score and not item.pinned:
                 audit.append(
@@ -173,6 +170,43 @@ class ContextBuilder:
                 )
                 continue
 
+            duplicate = deduplicator.find_duplicate(rendered)
+            should_deduplicate = duplicate is not None and (
+                not item.pinned or self.policy.deduplicate_pinned
+            )
+            if should_deduplicate and duplicate is not None:
+                if duplicate.mode == "similarity":
+                    similarity = duplicate.similarity or 0.0
+                    reason = (
+                        f"similar content already provided by {duplicate.item_id} "
+                        f"(similarity={similarity:.3f}, "
+                        f"threshold={self.policy.deduplication_similarity_threshold:.3f})"
+                    )
+                elif duplicate.mode == "normalized":
+                    reason = (
+                        "normalized content already provided by "
+                        f"{duplicate.item_id}"
+                    )
+                else:
+                    reason = (
+                        "identical content already provided by "
+                        f"{duplicate.item_id}"
+                    )
+
+                audit.append(
+                    AuditEntry(
+                        item_id=item.id,
+                        decision=Decision.DEDUPLICATED,
+                        reason=reason,
+                        original_tokens=token_count,
+                        final_tokens=0,
+                        score=score,
+                        category=item.category,
+                    )
+                )
+                continue
+
+            deduplicator.remember(item.id, rendered)
             candidates.append((item, rendered, token_count, score))
 
         pinned = [entry for entry in candidates if entry[0].pinned]
