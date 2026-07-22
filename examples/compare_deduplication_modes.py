@@ -291,6 +291,78 @@ def print_api_results(results: list[dict[str, Any]]) -> None:
         print(f"Finish reason:     {result['finish_reason']}")
 
 
+
+def _display_api_value(value: Any, *, decimals: int | None = None) -> str:
+    if value is None:
+        return "n/a"
+    if decimals is not None:
+        return f"{float(value):.{decimals}f}"
+    return str(value)
+
+
+def print_final_comparison(
+    reports: dict[str, dict[str, Any]],
+    api_results: list[dict[str, Any]] | None = None,
+) -> None:
+    """Print one final summary combining deduplication and endpoint results."""
+
+    api_by_mode = {
+        result["mode"]: result
+        for result in (api_results or [])
+    }
+    baseline_mode = next(iter(reports))
+    baseline_request_tokens = reports[baseline_mode]["estimated_message_tokens"]
+
+    print("\nFINAL DEDUPLICATION MODE COMPARISON")
+    print("=" * 150)
+    print(
+        f"{'Mode':12} {'Request est.':>13} {'Req. saved':>12} "
+        f"{'Selected':>9} {'Deduped':>9} {'Dropped':>8} "
+        f"{'API prompt':>11} {'API output':>10} {'API total':>10} "
+        f"{'Seconds':>9} {'Status':>10}"
+    )
+    print("-" * 150)
+
+    for mode, report in reports.items():
+        result = api_by_mode.get(mode)
+        request_tokens = int(report["estimated_message_tokens"])
+        request_saved = baseline_request_tokens - request_tokens
+        decisions = report["decisions"]
+
+        if result is None:
+            api_prompt = api_output = api_total = seconds = "n/a"
+            status = "not called"
+        else:
+            api_prompt = _display_api_value(result.get("prompt_tokens"))
+            api_output = _display_api_value(result.get("completion_tokens"))
+            api_total = _display_api_value(result.get("total_tokens"))
+            seconds = _display_api_value(
+                result.get("elapsed_seconds"),
+                decimals=3,
+            )
+            status = "ok" if result.get("ok") else "failed"
+
+        print(
+            f"{mode:12} "
+            f"{request_tokens:>13} "
+            f"{request_saved:>12} "
+            f"{len(report['selected_ids']):>9} "
+            f"{decisions.get('deduplicated', 0):>9} "
+            f"{decisions.get('dropped', 0):>8} "
+            f"{api_prompt:>11} "
+            f"{api_output:>10} "
+            f"{api_total:>10} "
+            f"{seconds:>9} "
+            f"{status:>10}"
+        )
+
+    print("-" * 150)
+    print(
+        f"'Req. saved' is relative to the first selected mode ({baseline_mode}). "
+        "API fields use provider-reported usage when available."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -353,6 +425,7 @@ def main() -> None:
             "\nNo endpoint calls were made. Add --call-api after setting "
             "OPENAI_BASE_URL, OPENAI_API_KEY, and OPENAI_MODEL."
         )
+        print_final_comparison(reports_by_mode)
         return
 
     print_api_disclaimer(len(args.modes))
@@ -366,6 +439,7 @@ def main() -> None:
         for mode in args.modes
     ]
     print_api_results(api_results)
+    print_final_comparison(reports_by_mode, api_results)
 
 
 if __name__ == "__main__":
