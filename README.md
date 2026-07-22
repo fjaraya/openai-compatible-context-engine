@@ -53,39 +53,94 @@ is sent to an OpenAI-compatible endpoint.
 - Optional Hugging Face tokenizer support
 - No mandatory runtime dependencies
 
-## Installation
+## Installation with uv
 
-### Install from source
+[`uv`](https://docs.astral.sh/uv/) is the recommended way to create the
+environment, install dependencies, run examples, execute tests, and build the
+distribution packages.
 
-Clone the repository and install the package:
+### Install uv
+
+On macOS or Linux:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+On macOS with Homebrew:
+
+```bash
+brew install uv
+```
+
+Verify the installation:
+
+```bash
+uv --version
+```
+
+### Clone and prepare the library
 
 ```bash
 git clone https://github.com/fjaraya/openai-compatible-context-engine.git
 cd openai-compatible-context-engine
-pip install .
+uv sync --extra dev
 ```
 
-For local development, install it in editable mode:
+`uv sync` creates the local `.venv`, installs the project in editable mode, and
+creates or updates `uv.lock`. The `dev` extra includes the test and build tools.
+
+Run the test suite:
 
 ```bash
-pip install -e ".[dev]"
+uv run python -m unittest discover -s tests -v
 ```
 
-### Build the distribution packages
-
-Install the build tool:
+Run the basic example:
 
 ```bash
-python -m pip install --upgrade build
+uv run python examples/openai_compatible.py
 ```
 
-Build both the wheel and source distribution:
+Run the comparison example:
 
 ```bash
-python -m build
+uv run python examples/compare_with_without_engine.py
 ```
 
-The generated files will be placed in `dist/`:
+### Enable optional integrations
+
+Install the OpenAI client integration:
+
+```bash
+uv sync --extra dev --extra openai
+```
+
+Install `tiktoken` support:
+
+```bash
+uv sync --extra dev --extra tiktoken
+```
+
+Install Hugging Face tokenizer support:
+
+```bash
+uv sync --extra dev --extra transformers
+```
+
+Install every optional dependency:
+
+```bash
+uv sync --all-extras
+```
+
+### Build the wheel and source distribution
+
+```bash
+uv build
+```
+
+The generated files are placed in `dist/`:
 
 ```text
 dist/
@@ -93,28 +148,45 @@ dist/
 └── openai_compatible_context_engine-0.1.0.tar.gz
 ```
 
-### Install from the generated wheel
+Test the wheel in an isolated environment:
 
 ```bash
-pip install dist/openai_compatible_context_engine-0.1.0-py3-none-any.whl
+uv run \
+  --with ./dist/openai_compatible_context_engine-0.1.0-py3-none-any.whl \
+  --no-project \
+  python -c "from openai_context_engine import ContextBuilder; print('Import successful')"
 ```
 
-For OpenAI tokenizers:
+### Add the library to an existing uv project
+
+From a local checkout during development:
 
 ```bash
-pip install "openai-compatible-context-engine[tiktoken]"
+uv add --editable ../openai-compatible-context-engine
 ```
 
-For Hugging Face tokenizers:
+Directly from a Git repository:
 
 ```bash
-pip install "openai-compatible-context-engine[transformers]"
+uv add git+https://github.com/fjaraya/openai-compatible-context-engine.git
 ```
 
-For development:
+After the package is published to a Python package registry:
 
 ```bash
-pip install "openai-compatible-context-engine[dev]"
+uv add openai-compatible-context-engine
+```
+
+### pip alternative
+
+The package remains compatible with standard Python tooling:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python -m unittest discover -s tests -v
+python -m build
 ```
 
 ## Quick start
@@ -198,7 +270,294 @@ print(bundle.report())
 The resulting `messages` value can be sent directly to an OpenAI-compatible
 chat-completions endpoint.
 
-## Calling an OpenAI-compatible endpoint
+## Integrating with existing software
+
+The engine does not replace your OpenAI client, HTTP library, proxy, or model
+endpoint. It replaces only the code that concatenates context into the prompt.
+
+This applies whether your application:
+
+- Uses the official OpenAI Python client
+- Calls an OpenAI-compatible `/v1/chat/completions` endpoint
+- Sends requests through LiteLLM, vLLM, or another gateway
+- Posts to an internal route such as `/chat/messages`
+- Uses `requests`, `httpx`, FastAPI, or a custom SDK
+
+### Typical application without the engine
+
+A common implementation concatenates every available source into one prompt:
+
+```python
+raw_context = "\n\n".join(
+    [
+        conversation_history,
+        retrieved_documents,
+        tool_results,
+        application_state,
+    ]
+)
+
+messages = [
+    {
+        "role": "system",
+        "content": system_prompt,
+    },
+    {
+        "role": "user",
+        "content": (
+            f"CONTEXT\n{raw_context}\n\n"
+            f"QUESTION\n{user_prompt}"
+        ),
+    },
+]
+
+response = client.chat.completions.create(
+    model=model,
+    messages=messages,
+    max_tokens=2_048,
+)
+```
+
+This works for small inputs, but it has no explicit input budget, output
+reservation, prioritization, deduplication, reduction policy, or audit trail.
+
+### The same application with the engine
+
+Convert each source into one or more `ContextItem` objects, build a bounded
+bundle, and keep the existing model invocation unchanged:
+
+```python
+from openai_context_engine import (
+    ContextBuilder,
+    ContextItem,
+    ContextPolicy,
+    TiktokenTokenizer,
+)
+
+builder = ContextBuilder(
+    tokenizer=TiktokenTokenizer(model="gpt-4o-mini"),
+    policy=ContextPolicy(
+        context_window=32_768,
+        reserved_output_tokens=2_048,
+        safety_margin_tokens=2_048,
+        minimum_score=0.20,
+        category_limits={
+            "history": 0.15,
+            "documents": 0.45,
+            "tool_results": 0.30,
+            "state": 0.10,
+        },
+    ),
+)
+
+items = [
+    ContextItem(
+        id="conversation-history",
+        content=conversation_history,
+        category="history",
+        priority=0.70,
+        relevance=0.80,
+    ),
+    ContextItem(
+        id="retrieved-documents",
+        content=retrieved_documents,
+        category="documents",
+        priority=0.80,
+        relevance=0.95,
+    ),
+    ContextItem(
+        id="tool-results",
+        content=tool_results,
+        category="tool_results",
+        priority=0.85,
+        relevance=0.90,
+    ),
+    ContextItem(
+        id="application-state",
+        content=application_state,
+        category="state",
+        pinned=True,
+    ),
+]
+
+bundle = builder.build(
+    items=items,
+    query=user_prompt,
+    fixed_texts=[
+        system_prompt,
+        user_prompt,
+    ],
+)
+
+messages = bundle.to_openai_messages(
+    system_prompt=system_prompt,
+    user_prompt=user_prompt,
+)
+
+response = client.chat.completions.create(
+    model=model,
+    messages=messages,
+    max_tokens=2_048,
+)
+
+context_report = bundle.report()
+```
+
+The endpoint call does not need to change. The engine produces a normal
+OpenAI-compatible `messages` list.
+
+For a custom HTTP endpoint, place the generated messages in the same request
+body your application already sends:
+
+```python
+import httpx
+
+payload = {
+    "model": model,
+    "messages": messages,
+    "max_tokens": 2_048,
+}
+
+response = httpx.post(
+    "https://your-endpoint.example.com/chat/messages",
+    json=payload,
+    headers={"Authorization": f"Bearer {api_key}"},
+    timeout=60,
+)
+response.raise_for_status()
+```
+
+The engine is unaware of the endpoint path. It only builds the bounded
+`messages` value.
+
+### Minimal integration wrapper
+
+For an existing codebase, isolate the change in one function:
+
+```python
+def build_model_messages(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    context_items: list[ContextItem],
+) -> tuple[list[dict[str, str]], dict]:
+    bundle = context_builder.build(
+        items=context_items,
+        query=user_prompt,
+        fixed_texts=[
+            system_prompt,
+            user_prompt,
+        ],
+    )
+
+    messages = bundle.to_openai_messages(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+
+    return messages, bundle.report()
+```
+
+Existing request code can then remain almost identical:
+
+```python
+messages, context_report = build_model_messages(
+    system_prompt=system_prompt,
+    user_prompt=user_prompt,
+    context_items=context_items,
+)
+
+response = client.chat.completions.create(
+    model=model,
+    messages=messages,
+    max_tokens=2_048,
+)
+```
+
+### What the integration adds
+
+| Without the engine | With the engine |
+|---|---|
+| Concatenates all available data | Selects context within a defined budget |
+| May consume output capacity | Reserves output tokens explicitly |
+| Duplicate content is sent repeatedly | Exact duplicates are removed |
+| Large items dominate the prompt | Large items may be reduced |
+| Context order is usually accidental | Context is ranked by policy |
+| One source can consume the whole prompt | Categories can have token limits |
+| Dropped information is invisible | Every decision is auditable |
+| Prompt growth is discovered at request time | Oversized pinned content fails before the API call |
+
+The engine does not determine business relevance automatically. The application
+still supplies `priority`, `relevance`, categories, metadata, and any custom
+scoring rules. It also does not replace retrieval, authorization, secret
+redaction, or response validation.
+
+## Compare with and without the engine
+
+The repository includes:
+
+```text
+examples/compare_with_without_engine.py
+```
+
+Run the local comparison:
+
+```bash
+uv run python examples/compare_with_without_engine.py
+```
+
+Example output:
+
+```text
+Metric                               Without engine      With engine
+------------------------------------------------------------------------
+Estimated request tokens                       6546              866
+Context items selected                            5                3
+Context items dropped                             0                2
+Fits nominal input budget                     False             True
+Estimated token reduction                      0.0%            86.8%
+```
+
+The exact numbers depend on the tokenizer and context data. The included example
+uses `ApproximateTokenizer` so it can run without external dependencies.
+
+The script uses the same prompt and source data in two paths:
+
+1. A raw implementation that concatenates every context item.
+2. An implementation that applies budgeting, ranking, deduplication, category
+   limits, and reduction.
+
+It prints:
+
+- Estimated request size
+- Whether each request fits the configured input budget
+- Selected and dropped item counts
+- Estimated token reduction
+- The audit decision for every item
+
+To send the engine-built request to a real OpenAI-compatible endpoint:
+
+```bash
+uv sync --extra openai
+
+export OPENAI_BASE_URL="https://your-endpoint.example.com/v1"
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_MODEL="your-model"
+
+uv run python examples/compare_with_without_engine.py --call-api
+```
+
+To also attempt the raw oversized request:
+
+```bash
+uv run python examples/compare_with_without_engine.py \
+  --call-api \
+  --call-raw-api
+```
+
+The raw request may fail when the endpoint enforces a smaller context window.
+
+## Calling an OpenAI-compatible endpoint directly
 
 ```python
 from openai import OpenAI
@@ -530,16 +889,39 @@ as instructions. Applications should also:
 
 ## Development
 
-Run the tests:
+Prepare the environment:
 
 ```bash
-python -m unittest discover -s tests -v
+uv sync --extra dev
+```
+
+Run the test suite:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+Run the examples:
+
+```bash
+uv run python examples/openai_compatible.py
+uv run python examples/compare_with_without_engine.py
 ```
 
 Build the package:
 
 ```bash
-python -m build
+rm -rf build dist
+uv build
+```
+
+Verify the generated wheel independently:
+
+```bash
+uv run \
+  --with ./dist/openai_compatible_context_engine-0.1.0-py3-none-any.whl \
+  --no-project \
+  python -c "import openai_context_engine; print(openai_context_engine.__file__)"
 ```
 
 ## Package naming

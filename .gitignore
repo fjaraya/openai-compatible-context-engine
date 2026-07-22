@@ -1,37 +1,31 @@
-# Python
+# Python caches
 __pycache__/
 *.py[cod]
-*$py.class
 
 # Virtual environments
 .venv/
 venv/
-env/
 
-# Packaging
+# Build artifacts
 build/
 dist/
 *.egg-info/
-.eggs/
+*.whl
+*.tar.gz
 
-# Testing
+# Test and tool caches
 .pytest_cache/
 .coverage
-coverage.xml
 htmlcov/
-
-# Type checking
 .mypy_cache/
-.pyright/
+.ruff_cache/
 
-# IDEs
-.idea/
-.vscode/
-
-# macOS
-.DS_Store
-
-# Environment files
+# Local environment
 .env
 .env.*
 !.env.example
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
