@@ -60,7 +60,7 @@ is sent to an OpenAI-compatible endpoint.
 Clone the repository and install the package:
 
 ```bash
-git clone https://github.com/YOUR_ORGANIZATION/openai-compatible-context-engine.git
+git clone https://github.com/fjaraya/openai-compatible-context-engine.git
 cd openai-compatible-context-engine
 pip install .
 ```
