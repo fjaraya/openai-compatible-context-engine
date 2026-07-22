@@ -1,9 +1,9 @@
 from .builder import ContextBuilder
-from .deduplication import (
-    Deduplicator,
-    DuplicateMatch,
-    SUPPORTED_DEDUPLICATION_MODES,
-    default_normalize_text,
+from .compressors import (
+    CallableCompressor,
+    Compressor,
+    ExtractiveCompressor,
+    OpenAIChatCompressor,
 )
 from .exceptions import (
     BudgetConfigurationError,
@@ -12,6 +12,8 @@ from .exceptions import (
 )
 from .models import (
     AuditEntry,
+    CompressionDecision,
+    CompressionEntry,
     ContextBundle,
     ContextItem,
     ContextPolicy,
@@ -31,23 +33,25 @@ __all__ = [
     "ApproximateTokenizer",
     "AuditEntry",
     "BudgetConfigurationError",
+    "CallableCompressor",
     "CallableTokenizer",
+    "CompressionDecision",
+    "CompressionEntry",
+    "Compressor",
     "ContextBuilder",
     "ContextBundle",
     "ContextEngineError",
     "ContextItem",
     "ContextPolicy",
-    "Deduplicator",
-    "DuplicateMatch",
     "Decision",
+    "ExtractiveCompressor",
     "HeadTailReducer",
+    "OpenAIChatCompressor",
     "PinnedItemOverflowError",
     "QueryAwareSentenceReducer",
     "Reducer",
-    "SUPPORTED_DEDUPLICATION_MODES",
     "SelectedItem",
     "TiktokenTokenizer",
     "Tokenizer",
     "TransformersTokenizer",
-    "default_normalize_text",
 ]

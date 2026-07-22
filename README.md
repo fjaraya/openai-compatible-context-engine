@@ -1,7 +1,7 @@
 # OpenAI-Compatible Context Engine for Python
 
-A lightweight, domain-agnostic Python library for selecting, reducing, budgeting,
-and assembling context for OpenAI-compatible chat-completion endpoints.
+A lightweight, domain-agnostic Python library for selecting, compressing, reducing,
+budgeting, and assembling context for OpenAI-compatible chat-completion endpoints.
 
 The library does not assume a specific use case. A context item may contain:
 
@@ -17,7 +17,7 @@ The library does not assume a specific use case. A context item may contain:
 
 Its main responsibility is to keep model input within a controlled token budget
 while preserving the most valuable context and producing an auditable record of
-what was included, reduced, deduplicated, or dropped.
+what was included, compressed, reduced, deduplicated, or dropped.
 
 ## Why this library exists
 
@@ -44,6 +44,7 @@ is sent to an OpenAI-compatible endpoint.
 - Optional custom scoring callbacks
 - Score-per-token selection
 - Configurable deduplication: none, exact, normalized, or near-duplicate similarity
+- Proactive compression: none, deterministic extractive, custom, or LLM-based
 - Per-category token limits
 - Query-aware extractive reduction
 - Head-and-tail truncation fallback
@@ -102,11 +103,20 @@ Run the basic example:
 uv run python examples/openai_compatible.py
 ```
 
-Run the comparison example:
+Run the comparison examples:
 
 ```bash
 uv run python examples/compare_with_without_engine.py
 uv run python examples/compare_deduplication_modes.py
+uv run python examples/compare_compression_modes.py
+```
+
+The LLM compression example requires the optional OpenAI client and endpoint
+credentials:
+
+```bash
+uv sync --extra openai
+uv run python examples/openai_llm_compression.py
 ```
 
 ### Enable optional integrations
@@ -145,15 +155,15 @@ The generated files are placed in `dist/`:
 
 ```text
 dist/
-├── openai_compatible_context_engine-0.2.0-py3-none-any.whl
-└── openai_compatible_context_engine-0.2.0.tar.gz
+├── openai_compatible_context_engine-0.3.0-py3-none-any.whl
+└── openai_compatible_context_engine-0.3.0.tar.gz
 ```
 
 Test the wheel in an isolated environment:
 
 ```bash
 uv run \
-  --with ./dist/openai_compatible_context_engine-0.2.0-py3-none-any.whl \
+  --with ./dist/openai_compatible_context_engine-0.3.0-py3-none-any.whl \
   --no-project \
   python -c "from openai_context_engine import ContextBuilder; print('Import successful')"
 ```
@@ -615,9 +625,15 @@ response = httpx.post(
 response.raise_for_status()
 ```
 
-The context engine does not invoke the model and does not depend on the endpoint
-path. It prepares a bounded OpenAI-compatible `messages` list and an audit
-report; your existing transport layer remains responsible for the API call.
+With `compression_mode="none"` or `compression_mode="extractive"`, the context
+engine does not invoke a model and does not depend on the endpoint path. It
+prepares a bounded OpenAI-compatible `messages` list and an audit report; your
+existing transport layer remains responsible for the final API call.
+
+With `compression_mode="llm"`, the builder invokes the configured compressor
+before assembling the final messages. That can add one model call per eligible
+context item, in addition to the final answer call. This behavior is explicit,
+optional, and recorded in the compression audit.
 
 ## Core concepts
 
@@ -668,6 +684,10 @@ policy = ContextPolicy(
     safety_margin_tokens=2_048,
     minimum_score=0.15,
     selection_mode="score_per_token",
+    deduplication_mode="exact",
+    compression_mode="extractive",
+    compression_target_ratio=0.50,
+    compression_min_tokens=512,
     category_limits={
         "history": 0.15,
         "documents": 0.50,
@@ -829,6 +849,207 @@ policy = ContextPolicy(
 Every removed item appears in the audit report with the matching item ID,
 deduplication mode, and similarity score when applicable.
 
+
+### Compression modes
+
+Compression is a proactive transformation stage. It runs after minimum-score
+filtering and deduplication, but before ranking and token-budget selection.
+It can make large, valuable items cheaper before they compete for the available
+context budget.
+
+Compression is different from reduction:
+
+| Stage | When it runs | Purpose |
+|---|---|---|
+| Compression | Before ranking and selection | Intentionally shrink eligible large items |
+| Reduction | Only when an item cannot fit | Last-resort fallback to fit the remaining budget |
+
+Configure compression through `ContextPolicy.compression_mode`:
+
+| Mode | Behavior | Endpoint calls |
+|---|---|---:|
+| `none` | Disables proactive compression | 0 |
+| `extractive` | Deterministic query-aware sentence selection with head/tail fallback | 0 |
+| `custom` | Uses an application-provided `Compressor` implementation | Depends on implementation |
+| `llm` | Uses an application-provided LLM compressor, such as `OpenAIChatCompressor` | Up to one per eligible item |
+
+The default is:
+
+```python
+ContextPolicy(compression_mode="none")
+```
+
+#### Deterministic extractive compression
+
+```python
+from openai_context_engine import (
+    ContextBuilder,
+    ContextPolicy,
+    TiktokenTokenizer,
+)
+
+builder = ContextBuilder(
+    tokenizer=TiktokenTokenizer(model="gpt-4o-mini"),
+    policy=ContextPolicy(
+        compression_mode="extractive",
+        compression_target_ratio=0.40,
+        compression_min_tokens=600,
+        compression_max_tokens=1_000,
+        compression_categories=("documents", "tool_results"),
+    ),
+)
+```
+
+This mode is deterministic and does not call an endpoint. It retains sentences
+with the strongest lexical overlap with the current query and falls back to
+head-and-tail preservation when necessary.
+
+#### OpenAI-compatible LLM compression
+
+```python
+from openai import OpenAI
+
+from openai_context_engine import (
+    ContextBuilder,
+    ContextPolicy,
+    OpenAIChatCompressor,
+    TiktokenTokenizer,
+)
+
+client = OpenAI(
+    base_url="https://your-endpoint.example.com/v1",
+    api_key="your-api-key",
+)
+
+compressor = OpenAIChatCompressor(
+    client=client,
+    model="your-model",
+    temperature=0.0,
+)
+
+builder = ContextBuilder(
+    tokenizer=TiktokenTokenizer(model="gpt-4o-mini"),
+    compressor=compressor,
+    policy=ContextPolicy(
+        compression_mode="llm",
+        compression_target_ratio=0.30,
+        compression_min_tokens=800,
+        compression_max_tokens=1_200,
+        compression_categories=("documents", "tool_results"),
+        compression_failure_mode="keep_original",
+    ),
+)
+```
+
+`OpenAIChatCompressor` accepts any client object that exposes:
+
+```python
+client.chat.completions.create(...)
+```
+
+The library does not import the OpenAI package internally. The official OpenAI
+client is only one compatible implementation.
+
+LLM compression can preserve meaning better than deterministic extraction, but
+it has material tradeoffs:
+
+- It adds latency and token cost before the final answer request.
+- It can be non-deterministic even at low temperature.
+- It may omit details or introduce unsupported wording.
+- It sends the eligible source content to the compression endpoint.
+- One large item generally means one additional compression call.
+
+Use deterministic compression by default. Enable LLM compression only when the
+quality improvement is worth the additional calls and when the data is allowed
+to be sent to that endpoint.
+
+#### Compression controls
+
+```python
+ContextPolicy(
+    compression_mode="extractive",
+    compression_target_ratio=0.50,
+    compression_min_tokens=512,
+    compression_max_tokens=1_000,
+    compression_categories=("documents", "tool_results"),
+    compress_pinned=False,
+    compression_failure_mode="keep_original",
+)
+```
+
+| Setting | Meaning |
+|---|---|
+| `compression_target_ratio` | Desired fraction of the original token count, between `0.0` and `1.0` |
+| `compression_min_tokens` | Items smaller than this value are not proactively compressed |
+| `compression_max_tokens` | Optional hard target for each compressed item |
+| `compression_categories` | Optional allowlist of categories eligible for compression |
+| `compress_pinned` | Whether mandatory pinned items may be compressed |
+| `compression_failure_mode` | Keep the original content or raise the compressor exception |
+
+Pinned items are not compressed by default. This avoids silently transforming
+mandatory context.
+
+#### Custom compressor
+
+```python
+from openai_context_engine import CallableCompressor
+
+
+def compress_with_internal_service(item, target_tokens, tokenizer, query):
+    result = internal_compression_service(
+        text=item.render(),
+        query=query,
+        target_tokens=target_tokens,
+    )
+    return result["compressed_text"]
+
+
+builder = ContextBuilder(
+    tokenizer=tokenizer,
+    compressor=CallableCompressor(compress_with_internal_service),
+    policy=ContextPolicy(
+        compression_mode="custom",
+        compression_target_ratio=0.40,
+        compression_min_tokens=500,
+    ),
+)
+```
+
+#### Compression audit
+
+Compression has its own audit trail because an item can be compressed and then
+later included, reduced, or dropped by the token-budget stage.
+
+```python
+report = bundle.report()
+print(report["compression"])
+```
+
+Example:
+
+```json
+{
+  "mode": "extractive",
+  "decisions": {
+    "compressed": 1
+  },
+  "original_tokens": 3200,
+  "final_tokens": 780,
+  "saved_tokens": 2420,
+  "audit": [
+    {
+      "item_id": "large-document",
+      "decision": "compressed",
+      "mode": "extractive",
+      "reason": "compressed toward a target of 800 tokens",
+      "original_tokens": 3200,
+      "final_tokens": 780,
+      "category": "documents"
+    }
+  ]
+}
+```
+
 ### Pinned items
 
 Pinned items are processed before optional items.
@@ -950,6 +1171,74 @@ uv run python examples/compare_deduplication_modes.py \\
 > load, and timing. Use repeated runs and task-specific quality checks before
 > attributing response differences solely to a deduplication mode.
 
+
+## Compare compression modes with an OpenAI-compatible endpoint
+
+The repository includes:
+
+```text
+examples/compare_compression_modes.py
+```
+
+Run the deterministic offline comparison:
+
+```bash
+uv run python examples/compare_compression_modes.py
+```
+
+This compares:
+
+- `none`: no proactive compression
+- `extractive`: deterministic query-aware compression
+
+To include LLM compression and call the endpoint for every mode:
+
+```bash
+uv sync --extra openai
+
+export OPENAI_BASE_URL="https://your-endpoint.example.com/v1"
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_MODEL="your-model"
+
+uv run python examples/compare_compression_modes.py --call-api
+```
+
+With the default sample, the command performs one final-answer call for each
+mode plus one LLM-compression call for the eligible large item. The exact number
+of calls depends on how many items meet the compression policy.
+
+Select modes explicitly:
+
+```bash
+uv run python examples/compare_compression_modes.py \
+  --call-api \
+  --modes none extractive llm
+```
+
+The script prints:
+
+- Estimated request size for every mode
+- Context tokens after compression
+- Compressed and dropped item counts
+- Tokens saved by proactive compression
+- The compression audit for every mode
+- Every final model response
+- Prompt, completion, and total API token usage
+- Request latency and finish reason
+- A warning about response variability and the additional LLM-compression calls
+
+A smaller direct example is also available:
+
+```text
+examples/openai_llm_compression.py
+```
+
+Run it with:
+
+```bash
+uv run python examples/openai_llm_compression.py
+```
+
 ## Tokenizers
 
 ### Approximate tokenizer
@@ -1057,7 +1346,7 @@ builder = ContextBuilder(
 
 ## Audit report
 
-Every build produces a report describing how each item was handled.
+Every build produces a report describing selection decisions and proactive compression transformations.
 
 ```python
 report = bundle.report()
@@ -1109,6 +1398,9 @@ Retrieval and filtering
     |
     v
 Domain-specific normalization
+    |
+    v
+Deduplication and optional compression
     |
     v
 OpenAI-Compatible Context Engine for Python
@@ -1166,6 +1458,7 @@ Run the examples:
 uv run python examples/openai_compatible.py
 uv run python examples/compare_with_without_engine.py
 uv run python examples/compare_deduplication_modes.py
+uv run python examples/compare_compression_modes.py
 ```
 
 Build the package:
@@ -1179,7 +1472,7 @@ Verify the generated wheel independently:
 
 ```bash
 uv run \
-  --with ./dist/openai_compatible_context_engine-0.2.0-py3-none-any.whl \
+  --with ./dist/openai_compatible_context_engine-0.3.0-py3-none-any.whl \
   --no-project \
   python -c "import openai_context_engine; print(openai_context_engine.__file__)"
 ```
@@ -1193,4 +1486,4 @@ uv run \
 
 ## License
 
-MIT
+MIT License. See [`LICENSE`](LICENSE).

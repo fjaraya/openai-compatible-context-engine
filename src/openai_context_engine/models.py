@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 import json
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 
 class Decision(str, Enum):
@@ -12,6 +12,12 @@ class Decision(str, Enum):
     DROPPED = "dropped"
     REDUCED = "reduced"
     DEDUPLICATED = "deduplicated"
+
+
+class CompressionDecision(str, Enum):
+    COMPRESSED = "compressed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -55,10 +61,20 @@ class ContextPolicy:
     selection_mode: str = "score_per_token"
     category_limits: Mapping[str, int | float] = field(default_factory=dict)
     allow_reduce_pinned: bool = True
+
     deduplication_mode: str = "exact"
     deduplication_similarity_threshold: float = 0.92
     deduplicate_pinned: bool = False
     deduplication_normalizer: Callable[[str], str] | None = None
+
+    compression_mode: str = "none"
+    compression_target_ratio: float = 0.50
+    compression_min_tokens: int = 512
+    compression_max_tokens: int | None = None
+    compression_categories: Sequence[str] | None = None
+    compress_pinned: bool = False
+    compression_failure_mode: str = "keep_original"
+
     custom_score: Callable[[ContextItem], float] | None = None
 
     @property
@@ -83,6 +99,17 @@ class AuditEntry:
 
 
 @dataclass(frozen=True)
+class CompressionEntry:
+    item_id: str
+    decision: CompressionDecision
+    mode: str
+    reason: str
+    original_tokens: int
+    final_tokens: int
+    category: str
+
+
+@dataclass(frozen=True)
 class SelectedItem:
     item: ContextItem
     rendered: str
@@ -99,6 +126,8 @@ class ContextBundle:
     context_tokens: int
     total_input_tokens: int
     query: str
+    compression_mode: str = "none"
+    compression_audit: list[CompressionEntry] = field(default_factory=list)
 
     @property
     def dropped_ids(self) -> list[str]:
@@ -111,6 +140,14 @@ class ContextBundle:
     @property
     def selected_ids(self) -> list[str]:
         return [entry.item.id for entry in self.selected]
+
+    @property
+    def compressed_ids(self) -> list[str]:
+        return [
+            entry.item_id
+            for entry in self.compression_audit
+            if entry.decision == CompressionDecision.COMPRESSED
+        ]
 
     def render_context(self) -> str:
         blocks: list[str] = []
@@ -159,6 +196,18 @@ class ContextBundle:
         counts: dict[str, int] = {}
         for entry in self.audit:
             counts[entry.decision.value] = counts.get(entry.decision.value, 0) + 1
+
+        compression_counts: dict[str, int] = {}
+        original_compression_tokens = 0
+        final_compression_tokens = 0
+        for entry in self.compression_audit:
+            compression_counts[entry.decision.value] = (
+                compression_counts.get(entry.decision.value, 0) + 1
+            )
+            if entry.decision == CompressionDecision.COMPRESSED:
+                original_compression_tokens += entry.original_tokens
+                final_compression_tokens += entry.final_tokens
+
         return {
             "input_budget": self.input_budget,
             "fixed_tokens": self.fixed_tokens,
@@ -166,7 +215,30 @@ class ContextBundle:
             "total_input_tokens": self.total_input_tokens,
             "selected_ids": self.selected_ids,
             "dropped_ids": self.dropped_ids,
+            "compressed_ids": self.compressed_ids,
             "decisions": counts,
+            "compression": {
+                "mode": self.compression_mode,
+                "decisions": compression_counts,
+                "original_tokens": original_compression_tokens,
+                "final_tokens": final_compression_tokens,
+                "saved_tokens": max(
+                    0,
+                    original_compression_tokens - final_compression_tokens,
+                ),
+                "audit": [
+                    {
+                        "item_id": entry.item_id,
+                        "decision": entry.decision.value,
+                        "mode": entry.mode,
+                        "reason": entry.reason,
+                        "original_tokens": entry.original_tokens,
+                        "final_tokens": entry.final_tokens,
+                        "category": entry.category,
+                    }
+                    for entry in self.compression_audit
+                ],
+            },
             "audit": [
                 {
                     "item_id": a.item_id,

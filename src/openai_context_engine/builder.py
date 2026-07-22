@@ -5,10 +5,17 @@ from datetime import datetime, timezone
 import math
 from typing import Iterable, Sequence
 
+from .compressors import (
+    Compressor,
+    ExtractiveCompressor,
+    SUPPORTED_COMPRESSION_MODES,
+)
 from .deduplication import Deduplicator, SUPPORTED_DEDUPLICATION_MODES
 from .exceptions import BudgetConfigurationError, PinnedItemOverflowError
 from .models import (
     AuditEntry,
+    CompressionDecision,
+    CompressionEntry,
     ContextBundle,
     ContextItem,
     ContextPolicy,
@@ -25,6 +32,7 @@ class ContextBuilder:
         tokenizer: Tokenizer,
         policy: ContextPolicy | None = None,
         reducers: Sequence[Reducer] | None = None,
+        compressor: Compressor | None = None,
     ):
         self.tokenizer = tokenizer
         self.policy = policy or ContextPolicy()
@@ -35,7 +43,10 @@ class ContextBuilder:
                 HeadTailReducer(),
             ]
         )
+        self.compressor = compressor
         self._validate_policy()
+        if self.policy.compression_mode.lower().strip() == "extractive":
+            self.compressor = compressor or ExtractiveCompressor()
 
     def _validate_policy(self) -> None:
         policy = self.policy
@@ -49,6 +60,7 @@ class ContextBuilder:
             raise BudgetConfigurationError(
                 "selection_mode must be 'score' or 'score_per_token'"
             )
+
         deduplication_mode = policy.deduplication_mode.lower().strip()
         if deduplication_mode not in SUPPORTED_DEDUPLICATION_MODES:
             supported = ", ".join(sorted(SUPPORTED_DEDUPLICATION_MODES))
@@ -58,6 +70,36 @@ class ContextBuilder:
         if not 0.0 <= policy.deduplication_similarity_threshold <= 1.0:
             raise BudgetConfigurationError(
                 "deduplication_similarity_threshold must be between 0.0 and 1.0"
+            )
+
+        compression_mode = policy.compression_mode.lower().strip()
+        if compression_mode not in SUPPORTED_COMPRESSION_MODES:
+            supported = ", ".join(sorted(SUPPORTED_COMPRESSION_MODES))
+            raise BudgetConfigurationError(
+                "compression_mode must be one of: " + supported
+            )
+        if not 0.0 < policy.compression_target_ratio < 1.0:
+            raise BudgetConfigurationError(
+                "compression_target_ratio must be greater than 0.0 and less than 1.0"
+            )
+        if policy.compression_min_tokens < 1:
+            raise BudgetConfigurationError(
+                "compression_min_tokens must be at least 1"
+            )
+        if (
+            policy.compression_max_tokens is not None
+            and policy.compression_max_tokens < 1
+        ):
+            raise BudgetConfigurationError(
+                "compression_max_tokens must be at least 1 when provided"
+            )
+        if policy.compression_failure_mode not in {"keep_original", "raise"}:
+            raise BudgetConfigurationError(
+                "compression_failure_mode must be 'keep_original' or 'raise'"
+            )
+        if compression_mode in {"llm", "custom"} and self.compressor is None:
+            raise BudgetConfigurationError(
+                f"compression_mode={compression_mode!r} requires a compressor"
             )
 
     def _score(self, item: ContextItem, now: datetime) -> float:
@@ -122,6 +164,129 @@ class ContextBuilder:
             current = current.with_content(reduced, token_count=tokens)
         return None
 
+    def _compression_target(self, original_tokens: int) -> int:
+        target = max(1, int(original_tokens * self.policy.compression_target_ratio))
+        if self.policy.compression_max_tokens is not None:
+            target = min(target, self.policy.compression_max_tokens)
+        return min(target, max(1, original_tokens - 1))
+
+    def _should_compress(self, item: ContextItem, token_count: int) -> bool:
+        mode = self.policy.compression_mode.lower().strip()
+        if mode == "none":
+            return False
+        if token_count < self.policy.compression_min_tokens:
+            return False
+        if item.pinned and not self.policy.compress_pinned:
+            return False
+        categories = self.policy.compression_categories
+        if categories is not None and item.category not in set(categories):
+            return False
+        return True
+
+    def _compress_item(
+        self,
+        item: ContextItem,
+        rendered: str,
+        token_count: int,
+        query: str,
+    ) -> tuple[ContextItem, str, int, CompressionEntry | None]:
+        if not self._should_compress(item, token_count):
+            return item, rendered, token_count, None
+
+        if self.compressor is None:
+            raise BudgetConfigurationError(
+                "compression is enabled but no compressor is available"
+            )
+
+        target_tokens = self._compression_target(token_count)
+        mode = self.policy.compression_mode.lower().strip()
+
+        try:
+            compressed = self.compressor.compress(
+                item=item,
+                target_tokens=target_tokens,
+                tokenizer=self.tokenizer,
+                query=query,
+            )
+        except Exception as exc:
+            if self.policy.compression_failure_mode == "raise":
+                raise
+            return (
+                item,
+                rendered,
+                token_count,
+                CompressionEntry(
+                    item_id=item.id,
+                    decision=CompressionDecision.FAILED,
+                    mode=mode,
+                    reason=f"compressor failed; original content retained: {type(exc).__name__}: {exc}",
+                    original_tokens=token_count,
+                    final_tokens=token_count,
+                    category=item.category,
+                ),
+            )
+
+        if not compressed:
+            return (
+                item,
+                rendered,
+                token_count,
+                CompressionEntry(
+                    item_id=item.id,
+                    decision=CompressionDecision.SKIPPED,
+                    mode=mode,
+                    reason="compressor returned no content; original content retained",
+                    original_tokens=token_count,
+                    final_tokens=token_count,
+                    category=item.category,
+                ),
+            )
+
+        compressed_tokens = self.tokenizer.count(compressed)
+        if compressed_tokens > target_tokens:
+            reduced = self._try_reduce(
+                item.with_content(compressed, token_count=compressed_tokens),
+                target_tokens,
+                query,
+            )
+            if reduced is not None:
+                compressed, compressed_tokens = reduced
+            else:
+                compressed = self.tokenizer.truncate(compressed, target_tokens)
+                compressed_tokens = self.tokenizer.count(compressed)
+
+        if compressed_tokens >= token_count:
+            return (
+                item,
+                rendered,
+                token_count,
+                CompressionEntry(
+                    item_id=item.id,
+                    decision=CompressionDecision.SKIPPED,
+                    mode=mode,
+                    reason="compressed output did not reduce token usage; original content retained",
+                    original_tokens=token_count,
+                    final_tokens=token_count,
+                    category=item.category,
+                ),
+            )
+
+        compressed_item = item.with_content(compressed, token_count=compressed_tokens)
+        return (
+            compressed_item,
+            compressed,
+            compressed_tokens,
+            CompressionEntry(
+                item_id=item.id,
+                decision=CompressionDecision.COMPRESSED,
+                mode=mode,
+                reason=f"compressed toward a target of {target_tokens} tokens",
+                original_tokens=token_count,
+                final_tokens=compressed_tokens,
+                category=item.category,
+            ),
+        )
+
     def build(
         self,
         *,
@@ -142,6 +307,7 @@ class ContextBuilder:
 
         item_budget = input_budget - fixed_tokens
         audit: list[AuditEntry] = []
+        compression_audit: list[CompressionEntry] = []
         candidates: list[tuple[ContextItem, str, int, float]] = []
         deduplicator = Deduplicator(
             mode=self.policy.deduplication_mode,
@@ -207,6 +373,14 @@ class ContextBuilder:
                 continue
 
             deduplicator.remember(item.id, rendered)
+            item, rendered, token_count, compression_entry = self._compress_item(
+                item,
+                rendered,
+                token_count,
+                query,
+            )
+            if compression_entry is not None:
+                compression_audit.append(compression_entry)
             candidates.append((item, rendered, token_count, score))
 
         pinned = [entry for entry in candidates if entry[0].pinned]
@@ -331,4 +505,6 @@ class ContextBuilder:
             context_tokens=consumed,
             total_input_tokens=fixed_tokens + consumed,
             query=query,
+            compression_mode=self.policy.compression_mode.lower().strip(),
+            compression_audit=compression_audit,
         )
