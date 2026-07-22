@@ -3,7 +3,7 @@
 A lightweight, domain-agnostic Python library for selecting, reducing, budgeting,
 and assembling context for OpenAI-compatible chat-completion endpoints.
 
-A context item may contain:
+The library does not assume a specific use case. A context item may contain:
 
 - Conversation history
 - Retrieved document fragments
@@ -55,16 +55,48 @@ is sent to an OpenAI-compatible endpoint.
 
 ## Installation
 
-Install from the wheel:
+### Install from source
+
+Clone the repository and install the package:
 
 ```bash
-pip install openai_compatible_context_engine-0.1.0-py3-none-any.whl
+git clone https://github.com/YOUR_ORGANIZATION/openai-compatible-context-engine.git
+cd openai-compatible-context-engine
+pip install .
 ```
 
-Install from source:
+For local development, install it in editable mode:
 
 ```bash
-pip install .
+pip install -e ".[dev]"
+```
+
+### Build the distribution packages
+
+Install the build tool:
+
+```bash
+python -m pip install --upgrade build
+```
+
+Build both the wheel and source distribution:
+
+```bash
+python -m build
+```
+
+The generated files will be placed in `dist/`:
+
+```text
+dist/
+├── openai_compatible_context_engine-0.1.0-py3-none-any.whl
+└── openai_compatible_context_engine-0.1.0.tar.gz
+```
+
+### Install from the generated wheel
+
+```bash
+pip install dist/openai_compatible_context_engine-0.1.0-py3-none-any.whl
 ```
 
 For OpenAI tokenizers:
