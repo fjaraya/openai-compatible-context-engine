@@ -494,48 +494,30 @@ redaction, or response validation.
 
 ## Compare with and without the engine
 
-The repository includes:
+The repository includes an end-to-end comparison script:
 
 ```text
 examples/compare_with_without_engine.py
 ```
 
-Run the local comparison:
+It builds two requests from the same question and the same source data:
+
+1. **Without the engine:** every context item is concatenated into the prompt.
+2. **With the engine:** context is budgeted, ranked, deduplicated, reduced, and
+   audited before the request is sent.
+
+Run the offline context comparison:
 
 ```bash
 uv run python examples/compare_with_without_engine.py
 ```
 
-Example output:
+This mode does not call a model. It compares request size, selected items,
+dropped items, budget compliance, estimated token reduction, and every engine
+decision.
 
-```text
-Metric                               Without engine      With engine
-------------------------------------------------------------------------
-Estimated request tokens                       6546              866
-Context items selected                            5                3
-Context items dropped                             0                2
-Fits nominal input budget                     False             True
-Estimated token reduction                      0.0%            86.8%
-```
-
-The exact numbers depend on the tokenizer and context data. The included example
-uses `ApproximateTokenizer` so it can run without external dependencies.
-
-The script uses the same prompt and source data in two paths:
-
-1. A raw implementation that concatenates every context item.
-2. An implementation that applies budgeting, ranking, deduplication, category
-   limits, and reduction.
-
-It prints:
-
-- Estimated request size
-- Whether each request fits the configured input budget
-- Selected and dropped item counts
-- Estimated token reduction
-- The audit decision for every item
-
-To send the engine-built request to a real OpenAI-compatible endpoint:
+To call a real OpenAI-compatible endpoint, install the optional client and set
+the endpoint configuration:
 
 ```bash
 uv sync --extra openai
@@ -543,38 +525,98 @@ uv sync --extra openai
 export OPENAI_BASE_URL="https://your-endpoint.example.com/v1"
 export OPENAI_API_KEY="your-api-key"
 export OPENAI_MODEL="your-model"
+```
 
+Then run:
+
+```bash
 uv run python examples/compare_with_without_engine.py --call-api
 ```
 
-To also attempt the raw oversized request:
+With `--call-api`, the script always sends **both** requests and prints:
 
-```bash
-uv run python examples/compare_with_without_engine.py \
-  --call-api \
-  --call-raw-api
+- The complete response without the context engine
+- The complete response with the context engine
+- Request success or failure for each path
+- Endpoint-reported prompt, completion, and total tokens when available
+- Request latency for each path
+- The context selection audit
+
+The output contains separate sections:
+
+```text
+MODEL RESPONSE — WITHOUT CONTEXT ENGINE
+============================================================================
+<model response>
+
+MODEL RESPONSE — WITH CONTEXT ENGINE
+============================================================================
+<model response>
 ```
 
-The raw request may fail when the endpoint enforces a smaller context window.
+Both calls use the same model, system prompt, user question, source data, and
+maximum output size. Only context construction changes.
 
-## Calling an OpenAI-compatible endpoint directly
+> **Comparison caveat:** The two responses come from separate model executions
+> and are not guaranteed to be identical or deterministic. Differences may be
+> caused by context construction, but also by sampling settings, temperature,
+> backend routing, provider-side model updates, hidden system prompts, caching,
+> request order, service load, and timing. Run the comparison repeatedly, fix
+> model parameters where supported, and use task-specific quality checks before
+> attributing a response difference to the context engine alone.
+
+The example intentionally keeps both requests small enough for a typical model
+to answer. The engine still removes a duplicate item, excludes unrelated data,
+and reduces an oversized category. This makes the comparison useful for both
+answer quality and token consumption instead of merely demonstrating a context
+overflow failure.
+
+### Integrating the generated messages with your endpoint
+
+The engine ends at `messages`. Your existing client or HTTP request sends that
+value exactly as before:
 
 ```python
-from openai import OpenAI
+bundle = builder.build(
+    items=context_items,
+    query=user_prompt,
+    fixed_texts=[system_prompt, user_prompt],
+)
 
-client = OpenAI(
-    base_url="https://your-endpoint.example.com/v1",
-    api_key="your-api-key",
+messages = bundle.to_openai_messages(
+    system_prompt=system_prompt,
+    user_prompt=user_prompt,
 )
 
 response = client.chat.completions.create(
-    model="your-model",
+    model=model,
     messages=messages,
     max_tokens=2_048,
 )
-
-print(response.choices[0].message.content)
 ```
+
+For an internal endpoint such as `/chat/messages`, place the same generated
+`messages` value in your existing payload:
+
+```python
+import httpx
+
+response = httpx.post(
+    "https://your-service.example.com/chat/messages",
+    json={
+        "model": model,
+        "messages": messages,
+        "max_tokens": 2_048,
+    },
+    headers={"Authorization": f"Bearer {api_key}"},
+    timeout=60,
+)
+response.raise_for_status()
+```
+
+The context engine does not invoke the model and does not depend on the endpoint
+path. It prepares a bounded OpenAI-compatible `messages` list and an audit
+report; your existing transport layer remains responsible for the API call.
 
 ## Core concepts
 
